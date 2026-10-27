@@ -59,6 +59,7 @@ class RobotState extends ChangeNotifier {
 
   // --- DEVICE CONNECTION & RADIO STATE ---
   ConnectionStatus connectionStatus = ConnectionStatus.disconnected;
+  bool get isConnected => connectionStatus == ConnectionStatus.connected;
   String activeProtocol = "Bluetooth / BLE";
   bool isRadioEnabled = true;
   bool isScanning = false;
@@ -380,7 +381,7 @@ class RobotState extends ChangeNotifier {
   void toggleHeadlights() {
     headlights = !headlights;
     relays[0] = headlights; // sync with switch panel Ch 1
-    bleService.sendData(headlights ? "W\n" : "w\n");
+    bleService.sendData(headlights ? "1\n" : "0\n");
     addTerminalLog(">>> SET_LIGHT=${headlights ? 1 : 0}", LogType.tx);
     notifyListeners();
   }
@@ -663,24 +664,119 @@ class RobotState extends ChangeNotifier {
     "Move forward at half speed",
     "Turn lights on",
     "Full stop",
-    "Arm pick object",
+    "Start dance mode",
   ];
 
-  void toggleVoiceListening() {
-    isVoiceListening = !isVoiceListening;
-    if (isVoiceListening) {
-      Future.delayed(const Duration(seconds: 2), () {
-        isVoiceListening = false;
-        lastVoiceTranscript = "Turn lights on";
-        voiceConfidence = 0.96;
-        voiceHistory.insert(0, lastVoiceTranscript);
-        headlights = true;
-        relays[0] = true;
-        addTerminalLog(">>> VOICE_CMD: '$lastVoiceTranscript' [CONF: 96%]", LogType.tx);
+  String? executeVoiceCommand(String rawTranscript, {double confidence = 0.95}) {
+    final text = rawTranscript.toLowerCase().trim();
+    if (text.isEmpty) return null;
+
+    lastVoiceTranscript = rawTranscript;
+    voiceConfidence = confidence;
+    if (!voiceHistory.contains(rawTranscript)) {
+      voiceHistory.insert(0, rawTranscript);
+      if (voiceHistory.length > 20) voiceHistory.removeLast();
+    }
+
+    String? executedAction;
+    String? btCmd;
+
+    // RGB Lamp / RGB Lights
+    if (text.contains("rgb") && (text.contains("on") || text.contains("start") || text.contains("enable"))) {
+      lampPower = true;
+      relays[1] = true;
+      btCmd = "RGB_POWER:1";
+      executedAction = "RGB Lamp ON";
+    } else if (text.contains("rgb") && (text.contains("off") || text.contains("of") || text.contains("stop") || text.contains("disable"))) {
+      lampPower = false;
+      relays[1] = false;
+      btCmd = "RGB_POWER:0";
+      executedAction = "RGB Lamp OFF";
+    } else if (text.contains("rgb") && text.contains("red")) {
+      setLampColor(const Color(0xFFFF0000));
+      executedAction = "RGB Color: Red";
+    } else if (text.contains("rgb") && text.contains("green")) {
+      setLampColor(const Color(0xFF00FF00));
+      executedAction = "RGB Color: Green";
+    } else if (text.contains("rgb") && text.contains("blue")) {
+      setLampColor(const Color(0xFF0000FF));
+      executedAction = "RGB Color: Blue";
+    } else if (text.contains("forward") || text.contains("ahead") || text.contains("front") || text.contains("straight")) {
+      throttle = 1.0;
+      steering = 0.0;
+      motionStatusText = "FORWARD • 100%";
+      btCmd = "F";
+      executedAction = "Move Forward (F)";
+    } else if (text.contains("backward") || text.contains("back") || text.contains("reverse")) {
+      throttle = -1.0;
+      steering = 0.0;
+      motionStatusText = "REVERSE • 100%";
+      btCmd = "B";
+      executedAction = "Reverse (B)";
+    } else if (text.contains("left")) {
+      throttle = 0.0;
+      steering = -1.0;
+      motionStatusText = "LEFT TURN";
+      btCmd = "L";
+      executedAction = "Turn Left (L)";
+    } else if (text.contains("right")) {
+      throttle = 0.0;
+      steering = 1.0;
+      motionStatusText = "RIGHT TURN";
+      btCmd = "R";
+      executedAction = "Turn Right (R)";
+    } else if (text.contains("stop") || text.contains("halt") || text.contains("freeze") || text.contains("brake") || text.contains("pause")) {
+      throttle = 0.0;
+      steering = 0.0;
+      danceMode = false;
+      motionStatusText = "IDLE • STANDBY";
+      btCmd = "S";
+      executedAction = "Full Stop (S)";
+    } else if (text.contains("light on") || text.contains("lights on") || text.contains("headlight on") || text.contains("turn on light") || text.contains("turn on the light") || text.contains("turn on lights") || text.contains("turn on the lights")) {
+      headlights = true;
+      relays[0] = true;
+      btCmd = "1";
+      executedAction = "Lights ON (1)";
+    } else if (text.contains("light off") || text.contains("lights off") || text.contains("headlight off") || text.contains("turn off light") || text.contains("turn off the light") || text.contains("turn off lights") || text.contains("turn off the lights")) {
+      headlights = false;
+      relays[0] = false;
+      btCmd = "0";
+      executedAction = "Lights OFF (0)";
+    } else if (text.contains("horn") || text.contains("beep") || text.contains("honk")) {
+      hornActive = true;
+      relays[3] = true;
+      btCmd = "H";
+      executedAction = "Horn Sounding (H)";
+      Future.delayed(const Duration(milliseconds: 1500), () {
+        hornActive = false;
+        relays[3] = false;
+        bleService.sendData("h\n");
         notifyListeners();
       });
+    } else if (text.contains("dance") || text.contains("party") || text.contains("celebrate")) {
+      danceMode = true;
+      motionStatusText = "DANCE CHOREOGRAPHY ACTIVE";
+      btCmd = "X";
+      executedAction = "Dance Mode (X)";
+    } else if (text.contains("faster") || text.contains("fast") || text.contains("full speed") || text.contains("high speed")) {
+      setSpeedCap(100.0);
+      executedAction = "Speed 100%";
+    } else if (text.contains("slow") || text.contains("half speed") || text.contains("slow down")) {
+      setSpeedCap(50.0);
+      executedAction = "Speed 50%";
+    } else {
+      executedAction = null;
     }
+
+    if (btCmd != null) {
+      bleService.sendData("$btCmd\n");
+      addTerminalLog(">>> VOICE_CMD: '$rawTranscript' -> [$btCmd] ($executedAction)", LogType.tx);
+    } else {
+      addTerminalLog("[VOICE] Unrecognized command: '$rawTranscript'", LogType.error);
+    }
+
     notifyListeners();
+    return executedAction;
   }
 
   // --- ESP32-CAM ---
