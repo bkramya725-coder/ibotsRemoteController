@@ -246,17 +246,26 @@ class RobotState extends ChangeNotifier {
 
     addTerminalLog("[${dev.protocol}] Handshake initiated with ${dev.name} (${dev.macAddress})...", LogType.bluetooth);
 
-    // Check if device is a mock/sample profile
-    final bool isMockDemo = dev.id == "bt-hc05-01" ||
-        dev.id == "bt-mecanum-02" ||
-        dev.id == "bt-nano-03" ||
-        dev.id == "ibt-classic-01" ||
-        dev.id == "ibt-4899";
+    const fakeMockMacs = {
+      "00:1A:7D:DA:71:13",
+      "00:14:03:05:58:20",
+      "98:D3:31:FC:2B:7A",
+      "24:6F:28:B2:1A:40",
+      "A4:CF:12:D5:78:10",
+      "7C:DF:A1:40:9B:12",
+    };
 
-    // Strictly attempt real hardware connection for real discovered/bonded devices or custom real MACs
-    final bool isRealHardware = dev.id.startsWith("real-") ||
-        dev.id.startsWith("bonded-") ||
-        (!isMockDemo && RegExp(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$').hasMatch(dev.macAddress));
+    final bool isFakeMock = fakeMockMacs.contains(dev.macAddress.toUpperCase()) &&
+        (dev.id == "bt-hc05-01" ||
+            dev.id == "bt-mecanum-02" ||
+            dev.id == "bt-nano-03" ||
+            dev.id == "ibt-classic-01" ||
+            dev.id == "ibt-4899");
+
+    final bool isRealHardware = !isFakeMock &&
+        (dev.id.startsWith("real-") ||
+            dev.id.startsWith("bonded-") ||
+            RegExp(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$').hasMatch(dev.macAddress));
 
     bool success = false;
     if (isRealHardware) {

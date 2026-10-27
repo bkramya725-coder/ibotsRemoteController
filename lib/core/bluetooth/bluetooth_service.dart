@@ -38,6 +38,8 @@ class RealBluetoothService extends ChangeNotifier {
   final Map<String, BluetoothDevice> _bleDeviceMap = {};
 
   BluetoothDevice? connectedBleDevice;
+  BluetoothCharacteristic? _bleTxChar;
+  BluetoothCharacteristic? _bleRxChar;
   StreamSubscription<List<ScanResult>>? _scanSub;
   StreamSubscription<bool>? _isScanningSub;
   StreamSubscription<BluetoothAdapterState>? _adapterSub;
@@ -45,6 +47,7 @@ class RealBluetoothService extends ChangeNotifier {
   StreamSubscription<int>? _classicStatusSub;
   StreamSubscription<Uint8List>? _classicDataSub;
   StreamSubscription<BluetoothConnectionState>? _bleConnSub;
+  StreamSubscription<List<int>>? _bleDataSub;
 
   Function(String data)? onDataReceived;
 
@@ -402,6 +405,44 @@ class RealBluetoothService extends ChangeNotifier {
     return false;
   }
 
+  // Setup BLE UART characteristics (FFE1, Nordic UART, or generic writable/notify characteristics)
+  Future<bool> _setupBleUart(BluetoothDevice bleDevice) async {
+    try {
+      final services = await bleDevice.discoverServices();
+      for (var s in services) {
+        debugPrint("[BLE GATT] Service: ${s.uuid}");
+        for (var c in s.characteristics) {
+          debugPrint("[BLE GATT] Char: ${c.uuid}, write=${c.properties.write}, writeNoResp=${c.properties.writeWithoutResponse}, notify=${c.properties.notify}");
+          final uuidStr = c.uuid.str.toLowerCase();
+          if (uuidStr.contains("ffe1") ||
+              uuidStr.contains("6e400002") ||
+              uuidStr.contains("6e400003") ||
+              c.properties.write ||
+              c.properties.writeWithoutResponse) {
+            _bleTxChar ??= c;
+          }
+          if (c.properties.notify || c.properties.indicate) {
+            _bleRxChar ??= c;
+            try {
+              await c.setNotifyValue(true);
+              _bleDataSub?.cancel();
+              _bleDataSub = c.onValueReceived.listen((data) {
+                final text = utf8.decode(data, allowMalformed: true);
+                onDataReceived?.call(text);
+              });
+            } catch (e) {
+              debugPrint("[BLE GATT] Error setting notify: $e");
+            }
+          }
+        }
+      }
+      return _bleTxChar != null;
+    } catch (e) {
+      debugPrint("[BLE GATT] Service discovery error: $e");
+      return false;
+    }
+  }
+
   // --- 5. Connect to Real Hardware Device (Classic SPP or BLE GATT) ---
   Future<bool> connect(RoboticDevice device) async {
     final mac = device.macAddress.trim().toUpperCase();
@@ -410,12 +451,19 @@ class RealBluetoothService extends ChangeNotifier {
     // Disconnect any existing link first
     await disconnect();
 
-    // Cancel active scans so the Bluetooth radio is completely free for RFCOMM handshake
+    // Cancel active scans so the Bluetooth radio is completely free for handshake
     await stopScan();
 
-    const String sppUuid = "00001101-0000-1000-8000-00805F9B34FB";
+    // Ensure real Bluetooth permissions are verified before connecting
+    await requestPermissions();
+    try {
+      await _classic.initPermissions();
+    } catch (_) {}
+
+    const String sppUuid = "00001101-0000-1000-8000-00805f9b34fb";
     final bool isClassic = isClassicSppDevice(device);
 
+    // 1. Try Classic SPP if device profile suggests Classic
     if (isClassic) {
       debugPrint("[Classic SPP] Initiating RFCOMM connection to $mac with UUID $sppUuid...");
       try {
@@ -428,30 +476,22 @@ class RealBluetoothService extends ChangeNotifier {
           notifyListeners();
           debugPrint("[Classic SPP] Connection successfully established to $mac");
           return true;
-        } else {
-          lastError = "Connection rejected by ${device.name} ($mac).";
         }
       } catch (e) {
-        debugPrint("[Classic SPP] Connection error: $e");
-        lastError = "Could not connect to ${device.name} ($mac). Ensure the HC-05 is powered on, paired in phone Settings (PIN 1234), and not connected to another app.";
+        debugPrint("[Classic SPP] RFCOMM connect error: $e");
       }
-
-      // STRICT: For HC-05 / Classic devices, do NOT attempt BLE GATT!
-      activeType = ActiveConnectionType.none;
-      connectedMac = null;
-      connectedName = null;
-      notifyListeners();
-      return false;
+      debugPrint("[Classic SPP] RFCOMM failed or device is BLE. Falling back to BLE GATT for $mac...");
     }
 
-    // BLE GATT connection branch (for BLE peripherals only)
+    // 2. BLE GATT connection branch (Supports BLE UART modules like AT-09, CC2541, JDY-30, HC-05 BLE)
     final bleDevice = _bleDeviceMap[mac] ??
         _bleDeviceMap[mac.toLowerCase()] ??
         BluetoothDevice.fromId(mac);
+
     try {
       debugPrint("[BLE Service] Attempting BLE GATT connect to $mac...");
       await bleDevice.connect(
-        timeout: const Duration(seconds: 10),
+        timeout: const Duration(seconds: 8),
         license: License.nonprofit,
       );
       _bleConnSub?.cancel();
@@ -460,16 +500,23 @@ class RealBluetoothService extends ChangeNotifier {
           activeType = ActiveConnectionType.none;
           connectedMac = null;
           connectedName = null;
+          _bleTxChar = null;
+          _bleRxChar = null;
           lastError = "BLE device disconnected.";
           notifyListeners();
         }
       });
+
+      // Discover UART characteristics (FFE1, Nordic UART, etc.)
+      await _setupBleUart(bleDevice);
+
       connectedBleDevice = bleDevice;
       activeType = ActiveConnectionType.bleGatt;
       connectedMac = mac;
       connectedName = device.name;
       lastError = null;
       notifyListeners();
+      debugPrint("[BLE Service] Connected to $mac via BLE GATT with TX char: ${_bleTxChar?.uuid}");
       return true;
     } catch (e) {
       debugPrint("[BLE Service] BLE GATT connection error: $e");
@@ -479,7 +526,7 @@ class RealBluetoothService extends ChangeNotifier {
       activeType = ActiveConnectionType.none;
       connectedMac = null;
       connectedName = null;
-      lastError = "Could not connect to ${device.name} via BLE: $e";
+      lastError = "Could not connect to ${device.name} ($mac): $e";
       notifyListeners();
       return false;
     }
@@ -499,8 +546,20 @@ class RealBluetoothService extends ChangeNotifier {
         }
         return true;
       } else if (activeType == ActiveConnectionType.bleGatt && connectedBleDevice != null) {
-        debugPrint("[BLE Service] BLE GATT TX not configured for Classic SPP commands.");
-        return false;
+        if (_bleTxChar != null) {
+          final bytes = utf8.encode(message);
+          if (_bleTxChar!.properties.writeWithoutResponse) {
+            await _bleTxChar!.write(bytes, withoutResponse: true);
+          } else {
+            await _bleTxChar!.write(bytes);
+          }
+          debugPrint("[BLE Service] GATT TX successful: ${message.trim()}");
+          return true;
+        } else {
+          debugPrint("[BLE Service] WARNING: No writable BLE characteristic configured.");
+          lastError = "No writable characteristic found on BLE device.";
+          return false;
+        }
       } else {
         debugPrint("[Bluetooth Service] TX dropped: no active connection (activeType=$activeType)");
         lastError = "Cannot send data: not connected to any Bluetooth device.";
@@ -509,7 +568,6 @@ class RealBluetoothService extends ChangeNotifier {
     } catch (e) {
       debugPrint("[Bluetooth Service] sendData exception: $e");
       lastError = "Write error: $e";
-      // If writing to classic socket threw, the RFCOMM link dropped
       if (activeType == ActiveConnectionType.classicSpp) {
         activeType = ActiveConnectionType.none;
         connectedMac = null;
@@ -528,6 +586,10 @@ class RealBluetoothService extends ChangeNotifier {
       if (connectedBleDevice != null) {
         await _bleConnSub?.cancel();
         _bleConnSub = null;
+        await _bleDataSub?.cancel();
+        _bleDataSub = null;
+        _bleTxChar = null;
+        _bleRxChar = null;
         await connectedBleDevice!.disconnect();
         connectedBleDevice = null;
       }

@@ -40,6 +40,34 @@ class _DevicesScreenState extends State<DevicesScreen> with SingleTickerProvider
     if (mounted) setState(() {});
   }
 
+  Future<void> _handleConnect(RoboticDevice item) async {
+    state.selectTargetDevice(item);
+    await state.connectToTargetDevice();
+    if (!state.currentDevice.isConnected && mounted) {
+      final err = state.bleService.lastError ?? "Could not connect to ${item.name}.";
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Row(
+            children: [
+              const Icon(Icons.error_outline, color: Colors.white, size: 20),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Text(
+                  err,
+                  style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600),
+                ),
+              ),
+            ],
+          ),
+          backgroundColor: const Color(0xFFDC2626),
+          behavior: SnackBarBehavior.floating,
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          duration: const Duration(seconds: 5),
+        ),
+      );
+    }
+  }
+
   IconData _getIconForType(String type) {
     switch (type.toLowerCase()) {
       case 'audio':
@@ -529,16 +557,31 @@ class _DevicesScreenState extends State<DevicesScreen> with SingleTickerProvider
                 "Paired & Saved Devices",
                 style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold, color: Color(0xFF0F172A)),
               ),
-              Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-                decoration: BoxDecoration(
-                  color: const Color(0xFFE2E8F0),
-                  borderRadius: BorderRadius.circular(10),
-                ),
-                child: Text(
-                  "${pairedList.length} Saved",
-                  style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, fontFamily: 'monospace', color: Color(0xFF475569)),
-                ),
+              Row(
+                children: [
+                  IconButton(
+                    icon: const Icon(Icons.refresh, size: 20, color: Color(0xFF0284C7)),
+                    tooltip: "Reload Paired Devices",
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    onPressed: () async {
+                      await state.bleService.getBondedDevices();
+                      if (mounted) setState(() {});
+                    },
+                  ),
+                  const SizedBox(width: 8),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                    decoration: BoxDecoration(
+                      color: const Color(0xFFE2E8F0),
+                      borderRadius: BorderRadius.circular(10),
+                    ),
+                    child: Text(
+                      "${pairedList.length} Saved",
+                      style: const TextStyle(fontSize: 10, fontWeight: FontWeight.bold, fontFamily: 'monospace', color: Color(0xFF475569)),
+                    ),
+                  ),
+                ],
               ),
             ],
           ),
@@ -646,8 +689,7 @@ class _DevicesScreenState extends State<DevicesScreen> with SingleTickerProvider
                               if (isLiveConnected) {
                                 state.disconnectDevice();
                               } else {
-                                state.selectTargetDevice(item);
-                                state.connectToTargetDevice();
+                                _handleConnect(item);
                               }
                             },
                       child: isConnecting
@@ -820,8 +862,7 @@ class _DevicesScreenState extends State<DevicesScreen> with SingleTickerProvider
                               if (isConnected) {
                                 state.disconnectDevice();
                               } else {
-                                state.selectTargetDevice(dev);
-                                state.connectToTargetDevice();
+                                _handleConnect(dev);
                               }
                             },
                       child: isConnecting
