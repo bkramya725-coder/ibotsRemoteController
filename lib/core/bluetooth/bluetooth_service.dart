@@ -36,6 +36,7 @@ class RealBluetoothService extends ChangeNotifier {
   List<RoboticDevice> realNearbyDevices = [];
   List<RoboticDevice> realBondedDevices = [];
   final Map<String, BluetoothDevice> _bleDeviceMap = {};
+  final Set<String> _knownBleMacs = {};
 
   BluetoothDevice? connectedBleDevice;
   BluetoothCharacteristic? _bleTxChar;
@@ -182,20 +183,21 @@ class RealBluetoothService extends ChangeNotifier {
       for (var dev in classicList) {
         final mac = dev.address.trim();
         if (mac.isEmpty) continue;
+        final macUpper = mac.toUpperCase();
         String name = dev.name?.trim() ?? "";
         if (name.isEmpty) {
           final shortMac = mac.length >= 5 ? mac.substring(mac.length - 5) : mac;
           name = "Paired Device ($shortMac)";
         }
 
-        uniqueBonded[mac] = RoboticDevice(
+        uniqueBonded[macUpper] = RoboticDevice(
           id: "bonded-$mac",
           name: name,
           macAddress: mac,
           ipAddress: "192.168.4.1",
           protocol: "Bluetooth (Classic)",
           rssi: -50,
-          isConnected: (activeType == ActiveConnectionType.classicSpp && connectedMac == mac),
+          isConnected: (activeType == ActiveConnectionType.classicSpp && connectedMac?.toUpperCase() == macUpper),
           deviceType: _guessDeviceType(name),
         );
       }
@@ -214,28 +216,37 @@ class RealBluetoothService extends ChangeNotifier {
         } catch (_) {}
 
         for (var dev in [...bonded, ...sysConnected]) {
-          final mac = dev.remoteId.str;
+          final mac = dev.remoteId.str.trim();
+          if (mac.isEmpty) continue;
+          final macUpper = mac.toUpperCase();
           _bleDeviceMap[mac] = dev;
+          _bleDeviceMap[macUpper] = dev;
+          _bleDeviceMap[mac.toLowerCase()] = dev;
+          _knownBleMacs.add(macUpper);
 
-          if (!uniqueBonded.containsKey(mac)) {
-            String name = dev.platformName.trim();
-            if (name.isEmpty) name = dev.advName.trim();
-            if (name.isEmpty) {
-              final shortMac = mac.length >= 5 ? mac.substring(mac.length - 5) : mac;
-              name = "Paired Device ($shortMac)";
-            }
-
-            uniqueBonded[mac] = RoboticDevice(
-              id: "bonded-$mac",
-              name: name,
-              macAddress: mac,
-              ipAddress: "192.168.4.1",
-              protocol: "BLE 5.2",
-              rssi: -55,
-              isConnected: dev.isConnected,
-              deviceType: _guessDeviceType(name),
-            );
+          String name = dev.platformName.trim();
+          if (name.isEmpty) name = dev.advName.trim();
+          if (name.isEmpty && uniqueBonded.containsKey(macUpper)) {
+            name = uniqueBonded[macUpper]!.name;
           }
+          if (name.isEmpty) {
+            final shortMac = mac.length >= 5 ? mac.substring(mac.length - 5) : mac;
+            name = "Paired Device ($shortMac)";
+          }
+
+          final bool isDevConnected = dev.isConnected ||
+              (activeType == ActiveConnectionType.bleGatt && connectedMac?.toUpperCase() == macUpper);
+
+          uniqueBonded[macUpper] = RoboticDevice(
+            id: uniqueBonded[macUpper]?.id ?? "bonded-$mac",
+            name: name,
+            macAddress: mac,
+            ipAddress: "192.168.4.1",
+            protocol: "BLE UART",
+            rssi: -55,
+            isConnected: isDevConnected,
+            deviceType: _guessDeviceType(name),
+          );
         }
       }
     } catch (e) {
@@ -293,7 +304,11 @@ class RealBluetoothService extends ChangeNotifier {
         for (var res in results) {
           final dev = res.device;
           final mac = dev.remoteId.str;
+          final macUpper = mac.toUpperCase();
           _bleDeviceMap[mac] = dev;
+          _bleDeviceMap[macUpper] = dev;
+          _bleDeviceMap[mac.toLowerCase()] = dev;
+          _knownBleMacs.add(macUpper);
 
           String name = dev.platformName.trim();
           if (name.isEmpty) name = res.advertisementData.advName.trim();
@@ -379,8 +394,17 @@ class RealBluetoothService extends ChangeNotifier {
 
   // Helper to determine if a device requires Bluetooth Classic Serial Port Profile (SPP)
   bool isClassicSppDevice(RoboticDevice device) {
-    final name = device.name.toUpperCase();
+    final macUpper = device.macAddress.toUpperCase();
+    if (_knownBleMacs.contains(macUpper) ||
+        _bleDeviceMap.containsKey(macUpper) ||
+        _bleDeviceMap.containsKey(device.macAddress.toLowerCase())) {
+      return false;
+    }
     final protocol = device.protocol.toUpperCase();
+    if (protocol.contains("BLE")) {
+      return false;
+    }
+    final name = device.name.toUpperCase();
     if (name.contains("HC-05") ||
         name.contains("HC05") ||
         name.contains("HC-06") ||
@@ -397,17 +421,14 @@ class RealBluetoothService extends ChangeNotifier {
     if (device.id.startsWith("bonded-") && !protocol.contains("BLE")) {
       return true;
     }
-    // If not discovered as a BLE GATT advertisement, treat as Classic SPP
-    if (!_bleDeviceMap.containsKey(device.macAddress.toUpperCase()) &&
-        !_bleDeviceMap.containsKey(device.macAddress.toLowerCase())) {
-      return true;
-    }
     return false;
   }
 
   // Setup BLE UART characteristics (FFE1, Nordic UART, or generic writable/notify characteristics)
   Future<bool> _setupBleUart(BluetoothDevice bleDevice) async {
     try {
+      _bleTxChar = null;
+      _bleRxChar = null;
       final services = await bleDevice.discoverServices();
       for (var s in services) {
         debugPrint("[BLE GATT] Service: ${s.uuid}");
@@ -445,7 +466,9 @@ class RealBluetoothService extends ChangeNotifier {
 
   // --- 5. Connect to Real Hardware Device (Classic SPP or BLE GATT) ---
   Future<bool> connect(RoboticDevice device) async {
-    final mac = device.macAddress.trim().toUpperCase();
+    final mac = device.macAddress.trim();
+    if (mac.isEmpty) return false;
+    final macUpper = mac.toUpperCase();
     lastError = null;
 
     // Disconnect any existing link first
@@ -461,13 +484,38 @@ class RealBluetoothService extends ChangeNotifier {
     } catch (_) {}
 
     const String sppUuid = "00001101-0000-1000-8000-00805f9b34fb";
-    final bool isClassic = isClassicSppDevice(device);
 
-    // 1. Try Classic SPP if device profile suggests Classic
+    // Detect if device is already known to be BLE or if connected at system BLE level
+    bool isBle = _knownBleMacs.contains(macUpper) ||
+        _bleDeviceMap.containsKey(macUpper) ||
+        _bleDeviceMap.containsKey(mac.toLowerCase()) ||
+        device.protocol.toUpperCase().contains("BLE");
+
+    if (!isBle) {
+      try {
+        final sys = await FlutterBluePlus.systemDevices([]);
+        for (var s in sys) {
+          if (s.remoteId.str.toUpperCase() == macUpper) {
+            isBle = true;
+            _knownBleMacs.add(macUpper);
+            _bleDeviceMap[mac] = s;
+            _bleDeviceMap[macUpper] = s;
+            break;
+          }
+        }
+      } catch (_) {}
+    }
+
+    final bool isClassic = !isBle && isClassicSppDevice(device);
+
+    // 1. Try Classic SPP only if device is strictly non-BLE Classic
     if (isClassic) {
       debugPrint("[Classic SPP] Initiating RFCOMM connection to $mac with UUID $sppUuid...");
       try {
-        final success = await _classic.connect(mac, sppUuid);
+        final success = await _classic.connect(mac, sppUuid).timeout(
+          const Duration(seconds: 4),
+          onTimeout: () => false,
+        );
         if (success) {
           activeType = ActiveConnectionType.classicSpp;
           connectedMac = mac;
@@ -485,17 +533,34 @@ class RealBluetoothService extends ChangeNotifier {
 
     // 2. BLE GATT connection branch (Supports BLE UART modules like AT-09, CC2541, JDY-30, HC-05 BLE)
     final bleDevice = _bleDeviceMap[mac] ??
+        _bleDeviceMap[macUpper] ??
         _bleDeviceMap[mac.toLowerCase()] ??
         BluetoothDevice.fromId(mac);
 
     try {
-      debugPrint("[BLE Service] Attempting BLE GATT connect to $mac...");
-      await bleDevice.connect(
-        timeout: const Duration(seconds: 8),
-        license: License.nonprofit,
-      );
+      debugPrint("[BLE Service] Attempting BLE GATT connect to $mac (alreadyConnected=\${bleDevice.isConnected})...");
+      if (!bleDevice.isConnected) {
+        try {
+          await bleDevice.connect(
+            timeout: const Duration(seconds: 6),
+            license: License.nonprofit,
+            autoConnect: false,
+          );
+        } catch (e) {
+          debugPrint("[BLE Service] bleDevice.connect note: $e");
+          final errStr = e.toString().toLowerCase();
+          if (!errStr.contains("already") && !bleDevice.isConnected) {
+            await Future.delayed(const Duration(milliseconds: 250));
+            if (!bleDevice.isConnected) {
+              rethrow;
+            }
+          }
+        }
+      }
+
       _bleConnSub?.cancel();
       _bleConnSub = bleDevice.connectionState.listen((state) {
+        debugPrint("[BLE Service] Connection state changed: $state");
         if (state == BluetoothConnectionState.disconnected && activeType == ActiveConnectionType.bleGatt) {
           activeType = ActiveConnectionType.none;
           connectedMac = null;
@@ -508,15 +573,21 @@ class RealBluetoothService extends ChangeNotifier {
       });
 
       // Discover UART characteristics (FFE1, Nordic UART, etc.)
-      await _setupBleUart(bleDevice);
+      final uartFound = await _setupBleUart(bleDevice);
+      if (!uartFound) {
+        throw Exception("Could not discover writable UART characteristic (FFE1) on \${device.name}");
+      }
 
       connectedBleDevice = bleDevice;
       activeType = ActiveConnectionType.bleGatt;
       connectedMac = mac;
       connectedName = device.name;
+      _knownBleMacs.add(macUpper);
+      _bleDeviceMap[macUpper] = bleDevice;
+      _bleDeviceMap[mac] = bleDevice;
       lastError = null;
       notifyListeners();
-      debugPrint("[BLE Service] Connected to $mac via BLE GATT with TX char: ${_bleTxChar?.uuid}");
+      debugPrint("[BLE Service] Connected to $mac via BLE GATT with TX char: \${_bleTxChar?.uuid}");
       return true;
     } catch (e) {
       debugPrint("[BLE Service] BLE GATT connection error: $e");
@@ -526,7 +597,7 @@ class RealBluetoothService extends ChangeNotifier {
       activeType = ActiveConnectionType.none;
       connectedMac = null;
       connectedName = null;
-      lastError = "Could not connect to ${device.name} ($mac): $e";
+      lastError = "Could not connect to \${device.name} ($mac): $e";
       notifyListeners();
       return false;
     }
