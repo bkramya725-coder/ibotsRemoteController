@@ -44,6 +44,7 @@ class RealBluetoothService extends ChangeNotifier {
   StreamSubscription<bc.Device>? _classicDiscoverySub;
   StreamSubscription<int>? _classicStatusSub;
   StreamSubscription<Uint8List>? _classicDataSub;
+  StreamSubscription<BluetoothConnectionState>? _bleConnSub;
 
   Function(String data)? onDataReceived;
 
@@ -59,13 +60,24 @@ class RealBluetoothService extends ChangeNotifier {
         notifyListeners();
       });
 
+      // Bluetooth Classic status listener: 0 = disconnected, 1 = connecting, 2 = connected
       _classicStatusSub = _classic.onDeviceStatusChanged().listen((status) {
-        // Status 1 = connected, 0 = disconnected
-        if (status == 0 && activeType == ActiveConnectionType.classicSpp) {
-          activeType = ActiveConnectionType.none;
-          connectedMac = null;
-          connectedName = null;
-          notifyListeners();
+        debugPrint("[Classic Service] onDeviceStatusChanged: status=$status (0=disc, 1=conn-ing, 2=conn-ed)");
+        if (status == bc.Device.connected) {
+          // Status 2: Hardware RFCOMM socket established
+          if (activeType != ActiveConnectionType.classicSpp) {
+            activeType = ActiveConnectionType.classicSpp;
+            notifyListeners();
+          }
+        } else if (status == bc.Device.disconnected) {
+          // Status 0: Remote device disconnected or link dropped
+          if (activeType == ActiveConnectionType.classicSpp) {
+            activeType = ActiveConnectionType.none;
+            connectedMac = null;
+            connectedName = null;
+            lastError = "Bluetooth Classic connection disconnected.";
+            notifyListeners();
+          }
         }
       });
 
@@ -362,50 +374,101 @@ class RealBluetoothService extends ChangeNotifier {
     notifyListeners();
   }
 
+  // Helper to determine if a device requires Bluetooth Classic Serial Port Profile (SPP)
+  bool isClassicSppDevice(RoboticDevice device) {
+    final name = device.name.toUpperCase();
+    final protocol = device.protocol.toUpperCase();
+    if (name.contains("HC-05") ||
+        name.contains("HC05") ||
+        name.contains("HC-06") ||
+        name.contains("HC06") ||
+        name.contains("HC-") ||
+        name.contains("SPP") ||
+        name.contains("ARDUINO") ||
+        name.contains("CLASSIC")) {
+      return true;
+    }
+    if (protocol.contains("CLASSIC")) {
+      return true;
+    }
+    if (device.id.startsWith("bonded-") && !protocol.contains("BLE")) {
+      return true;
+    }
+    // If not discovered as a BLE GATT advertisement, treat as Classic SPP
+    if (!_bleDeviceMap.containsKey(device.macAddress.toUpperCase()) &&
+        !_bleDeviceMap.containsKey(device.macAddress.toLowerCase())) {
+      return true;
+    }
+    return false;
+  }
+
   // --- 5. Connect to Real Hardware Device (Classic SPP or BLE GATT) ---
   Future<bool> connect(RoboticDevice device) async {
-    final mac = device.macAddress;
+    final mac = device.macAddress.trim().toUpperCase();
     lastError = null;
 
     // Disconnect any existing link first
     await disconnect();
 
-    // Strategy: If protocol indicates Classic, or by default for robotics SPP (HC-05/HC-06),
-    // try Bluetooth Classic SPP connection first.
+    // Cancel active scans so the Bluetooth radio is completely free for RFCOMM handshake
+    await stopScan();
+
     const String sppUuid = "00001101-0000-1000-8000-00805F9B34FB";
+    final bool isClassic = isClassicSppDevice(device);
 
-    bool isClassicDevice = device.protocol.contains("Classic") ||
-        device.id.startsWith("classic-") ||
-        !_bleDeviceMap.containsKey(mac);
-
-    if (isClassicDevice) {
+    if (isClassic) {
+      debugPrint("[Classic SPP] Initiating RFCOMM connection to $mac with UUID $sppUuid...");
       try {
-        debugPrint("[BLE/Classic Service] Attempting Classic SPP connect to $mac...");
         final success = await _classic.connect(mac, sppUuid);
         if (success) {
           activeType = ActiveConnectionType.classicSpp;
           connectedMac = mac;
           connectedName = device.name;
+          lastError = null;
           notifyListeners();
+          debugPrint("[Classic SPP] Connection successfully established to $mac");
           return true;
+        } else {
+          lastError = "Connection rejected by ${device.name} ($mac).";
         }
       } catch (e) {
-        debugPrint("[Classic Service] Classic SPP connection error: $e");
+        debugPrint("[Classic SPP] Connection error: $e");
+        lastError = "Could not connect to ${device.name} ($mac). Ensure the HC-05 is powered on, paired in phone Settings (PIN 1234), and not connected to another app.";
       }
+
+      // STRICT: For HC-05 / Classic devices, do NOT attempt BLE GATT!
+      activeType = ActiveConnectionType.none;
+      connectedMac = null;
+      connectedName = null;
+      notifyListeners();
+      return false;
     }
 
-    // Attempt BLE GATT connection if Classic failed or device was discovered via BLE
-    final bleDevice = _bleDeviceMap[mac] ?? BluetoothDevice.fromId(mac);
+    // BLE GATT connection branch (for BLE peripherals only)
+    final bleDevice = _bleDeviceMap[mac] ??
+        _bleDeviceMap[mac.toLowerCase()] ??
+        BluetoothDevice.fromId(mac);
     try {
-      debugPrint("[BLE/Classic Service] Attempting BLE GATT connect to $mac...");
+      debugPrint("[BLE Service] Attempting BLE GATT connect to $mac...");
       await bleDevice.connect(
         timeout: const Duration(seconds: 10),
         license: License.nonprofit,
       );
+      _bleConnSub?.cancel();
+      _bleConnSub = bleDevice.connectionState.listen((state) {
+        if (state == BluetoothConnectionState.disconnected && activeType == ActiveConnectionType.bleGatt) {
+          activeType = ActiveConnectionType.none;
+          connectedMac = null;
+          connectedName = null;
+          lastError = "BLE device disconnected.";
+          notifyListeners();
+        }
+      });
       connectedBleDevice = bleDevice;
       activeType = ActiveConnectionType.bleGatt;
       connectedMac = mac;
       connectedName = device.name;
+      lastError = null;
       notifyListeners();
       return true;
     } catch (e) {
@@ -413,37 +476,47 @@ class RealBluetoothService extends ChangeNotifier {
       try {
         await bleDevice.disconnect();
       } catch (_) {}
-
-      // If BLE failed and we haven't tried Classic yet, try Classic SPP now!
-      if (!isClassicDevice) {
-        try {
-          debugPrint("[BLE/Classic Service] Falling back to Classic SPP connect for $mac...");
-          final success = await _classic.connect(mac, sppUuid);
-          if (success) {
-            activeType = ActiveConnectionType.classicSpp;
-            connectedMac = mac;
-            connectedName = device.name;
-            notifyListeners();
-            return true;
-          }
-        } catch (_) {}
-      }
-
-      lastError = "Could not connect to ${device.name}. Ensure device is powered on and in range.";
+      activeType = ActiveConnectionType.none;
+      connectedMac = null;
+      connectedName = null;
+      lastError = "Could not connect to ${device.name} via BLE: $e";
       notifyListeners();
       return false;
     }
   }
 
-  Future<void> sendData(String message) async {
+  Future<bool> sendData(String message) async {
     try {
       debugPrint("[Bluetooth Service] TX: ${message.trim()} (mode: $activeType, mac: $connectedMac)");
       if (activeType == ActiveConnectionType.classicSpp) {
         final ok = await _classic.write(message);
         debugPrint("[Classic Service] write result: $ok");
+        if (!ok) {
+          debugPrint("[Classic Service] WARNING: _classic.write returned false. Link may be lost.");
+          lastError = "Write failed: Device rejected transmission.";
+          notifyListeners();
+          return false;
+        }
+        return true;
+      } else if (activeType == ActiveConnectionType.bleGatt && connectedBleDevice != null) {
+        debugPrint("[BLE Service] BLE GATT TX not configured for Classic SPP commands.");
+        return false;
+      } else {
+        debugPrint("[Bluetooth Service] TX dropped: no active connection (activeType=$activeType)");
+        lastError = "Cannot send data: not connected to any Bluetooth device.";
+        return false;
       }
     } catch (e) {
-      debugPrint("[Bluetooth Service] sendData error: $e");
+      debugPrint("[Bluetooth Service] sendData exception: $e");
+      lastError = "Write error: $e";
+      // If writing to classic socket threw, the RFCOMM link dropped
+      if (activeType == ActiveConnectionType.classicSpp) {
+        activeType = ActiveConnectionType.none;
+        connectedMac = null;
+        connectedName = null;
+        notifyListeners();
+      }
+      return false;
     }
   }
 
@@ -453,6 +526,8 @@ class RealBluetoothService extends ChangeNotifier {
         await _classic.disconnect();
       }
       if (connectedBleDevice != null) {
+        await _bleConnSub?.cancel();
+        _bleConnSub = null;
         await connectedBleDevice!.disconnect();
         connectedBleDevice = null;
       }

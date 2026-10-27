@@ -40,6 +40,15 @@ class RobotState extends ChangeNotifier {
           macAddress: bleService.connectedMac ?? currentDevice.macAddress,
           isConnected: true,
         );
+        addTerminalLog("[SYS] Connected to ${currentDevice.name} (${currentDevice.macAddress}) via ${bleService.activeType == ActiveConnectionType.classicSpp ? 'Classic SPP' : 'BLE'}", LogType.system);
+      }
+    } else {
+      // Bluetooth hardware is disconnected
+      if (connectionStatus == ConnectionStatus.connected) {
+        connectionStatus = ConnectionStatus.disconnected;
+        currentDevice = currentDevice.copyWith(isConnected: false);
+        final err = bleService.lastError ?? "Bluetooth connection disconnected.";
+        addTerminalLog("[SYS] $err", LogType.error);
       }
     }
     if (activeProtocol.contains("Bluetooth") || activeProtocol.contains("BLE")) {
@@ -237,26 +246,27 @@ class RobotState extends ChangeNotifier {
 
     addTerminalLog("[${dev.protocol}] Handshake initiated with ${dev.name} (${dev.macAddress})...", LogType.bluetooth);
 
-    // Check if device is a real hardware Bluetooth device (bonded, discovered, or valid MAC)
+    // Check if device is a mock/sample profile
     final bool isMockDemo = dev.id == "bt-hc05-01" ||
         dev.id == "bt-mecanum-02" ||
         dev.id == "bt-nano-03" ||
         dev.id == "ibt-classic-01" ||
         dev.id == "ibt-4899";
 
-    final bool isRealHardware = !isMockDemo ||
-        dev.id.startsWith("real-") ||
+    // Strictly attempt real hardware connection for real discovered/bonded devices or custom real MACs
+    final bool isRealHardware = dev.id.startsWith("real-") ||
         dev.id.startsWith("bonded-") ||
-        RegExp(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$').hasMatch(dev.macAddress);
+        (!isMockDemo && RegExp(r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$').hasMatch(dev.macAddress));
 
-    bool success = true;
+    bool success = false;
     if (isRealHardware) {
-      // Real Bluetooth connection attempt to hardware (HC-05 Classic SPP or BLE GATT)
       addTerminalLog("[SYS] Connecting to real hardware ${dev.macAddress}...", LogType.system);
       success = await bleService.connect(dev);
     } else {
-      // Simulated delay for demo device
-      await Future.delayed(const Duration(milliseconds: 1000));
+      // Mock demo device tapped: Do NOT claim connection!
+      await Future.delayed(const Duration(milliseconds: 600));
+      addTerminalLog("[DEMO] '${dev.name}' is a sample demo profile. Pair your physical HC-05 in phone Bluetooth Settings and select it from 'Paired & Saved Devices'.", LogType.error);
+      success = false;
     }
 
     if (success) {
@@ -267,7 +277,9 @@ class RobotState extends ChangeNotifier {
       addTerminalLog("[${dev.protocol}] Connection established! RSSI: ${dev.rssi} dBm", LogType.system);
     } else {
       connectionStatus = ConnectionStatus.disconnected;
-      addTerminalLog("[${dev.protocol}] Connection failed to ${dev.name}. Check device power or pairing.", LogType.error);
+      currentDevice = dev.copyWith(isConnected: false);
+      final errorMsg = bleService.lastError ?? "Connection failed to ${dev.name}. Check device power or pairing.";
+      addTerminalLog("[${dev.protocol}] $errorMsg", LogType.error);
     }
     notifyListeners();
   }
